@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../services/firebase';
-import { ref, onValue, set } from 'firebase/database';
+import { ref, onValue, set, remove } from 'firebase/database';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const genAI = new GoogleGenerativeAI('AIzaSyA89jMg3iGXmKCI7AmeDHzEI7lmUcCgTJQ');
@@ -35,6 +35,12 @@ function TeacherDash() {
   const [isAILoading, setIsAILoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
 
+  // 🟢 NEW: Global Telemetry Logger
+  const logTelemetry = (msg) => {
+    if (!currentStudent) return;
+    set(ref(db, `Learning_Logs/${currentStudent}/Telemetry/${Date.now()}`), `[TEACHER] ${msg}`);
+  };
+
   // ═══════════════════════════════════════════════════════════════════════════
   // 2. DATA SYNCHRONIZATION
   // ═══════════════════════════════════════════════════════════════════════════
@@ -61,20 +67,30 @@ function TeacherDash() {
     if (!currentStudent) return;
     const studentRef = ref(db, `Learning_Logs/${currentStudent}`);
     const unsubscribe = onValue(studentRef, (snapshot) => {
-      let total = 0, errs = 0, logs = [], dataToExport = [];
+      let total = 0, errs = 0, dataToExport = [];
+      let tLogs = [];
+
       if (snapshot.exists()) {
-        snapshot.forEach((child) => {
-          const val = child.val() || {};
-          if (child.key !== 'Current_Command' && child.key !== 'Init') {
+        const data = snapshot.val();
+        
+        // 🟢 NEW: Parse the God's-Eye Telemetry Node
+        if (data.Telemetry) {
+          const keys = Object.keys(data.Telemetry).sort((a, b) => b - a); // Newest first
+          tLogs = keys.map(k => `[${new Date(parseInt(k)).toLocaleTimeString()}] ${data.Telemetry[k]}`);
+        }
+
+        // Parse Standard Stats
+        Object.keys(data).forEach((key) => {
+          if (key !== 'Current_Command' && key !== 'Init' && key !== 'Telemetry') {
+            const val = data[key];
             total++;
             if (val.Status === "Error") errs++;
-            logs.unshift(`[${new Date(val.Timestamp || Date.now()).toLocaleTimeString()}] Input: ${val.Character_ID} | ${val.Status}`);
-            dataToExport.push({ ...val, id: child.key });
+            dataToExport.push({ ...val, id: key });
           }
         });
       }
       setStats({ total, errors: errs, accuracy: total > 0 ? Math.round(((total - errs) / total) * 100) : 100 });
-      setTerminalLogs(logs.slice(0, 10));
+      setTerminalLogs(tLogs.slice(0, 20)); // Shows last 20 events
       setExportData(dataToExport);
     });
     return () => unsubscribe();
@@ -92,16 +108,26 @@ function TeacherDash() {
     speak("Profile added for " + name);
   };
 
+  // 🟢 NEW: Hard Reset Function
+  const handleResetStudent = () => {
+    if (window.confirm(`⚠️ WARNING ⚠️\nAre you sure you want to completely erase all data, analytics, and telemetry for ${currentStudent}?`)) {
+      set(ref(db, `Learning_Logs/${currentStudent}`), {
+        Init: { Timestamp: new Date().getTime(), Status: "Created" },
+        Telemetry: { [Date.now()]: "[SYSTEM] Teacher performed a Hard Reset on student profile." }
+      });
+      speak(`Profile reset for ${currentStudent}`);
+    }
+  };
+
   const executeCommand = (payload) => {
     if (!currentStudent) return;
-    // 1. Send to student's screen
     set(ref(db, `Learning_Logs/${currentStudent}/Current_Command`), payload);
-    // 2. Send to ESP32 Hardware
-    set(ref(db, 'Schools/School_ID_001/Hardware_Link'), { target: payload.target, timestamp: new Date().getTime() });
+    set(ref(db, 'Hardware_Link'), { target: payload.target, timestamp: new Date().getTime(), status: "STREAMING" });
   };
 
   const pushManualChar = (char, label) => {
     if (isStreaming) return;
+    logTelemetry(`Forced Hardware Actuation: [ ${char} ]`);
     executeCommand({ command_type: "FORCE_HARDWARE", target: char, test_type: label, audio_prompt: `Find the character ${char}`, timestamp: new Date().getTime(), status: "AWAITING_INPUT" });
     speak("Pushing " + char);
   };
@@ -109,13 +135,27 @@ function TeacherDash() {
   const handleStream = async () => {
     if (!streamText || isStreaming) return;
     setIsStreaming(true);
-    speak("Streaming initiated.");
-    const input = streamText.toUpperCase().split('');
     
+    const fullWord = streamText.toUpperCase();
+    const input = fullWord.split('');
+
+    speak(`Streaming the word: ${fullWord}`);
+    logTelemetry(`Deployed Word Stream: [ ${fullWord} ]`);
+
+    set(ref(db, 'Hardware_Link'), { target: fullWord, timestamp: new Date().getTime(), status: "STREAMING" });
+
     for (const char of input) {
-      executeCommand({ command_type: "FORCE_HARDWARE", target: char, test_type: "Word Stream", audio_prompt: `Find ${char}`, timestamp: new Date().getTime(), status: "AWAITING_INPUT" });
-      await new Promise(r => setTimeout(r, 2600));
+      set(ref(db, `Learning_Logs/${currentStudent}/Current_Command`), {
+          command_type: "FORCE_HARDWARE", 
+          target: char, 
+          test_type: "Word Stream", 
+          audio_prompt: `Spelling ${char}`, 
+          timestamp: new Date().getTime(), 
+          status: "AWAITING_INPUT" 
+      });
+      await new Promise(r => setTimeout(r, 1500));
     }
+    
     setIsStreaming(false);
     setStreamText("");
     speak("Streaming finished.");
@@ -124,34 +164,31 @@ function TeacherDash() {
   const deployTest = (subject) => {
     if (!cloudQuestions?.[subject]) return;
     const test = cloudQuestions[subject][selectedTests[subject]];
+    logTelemetry(`Deployed Test (${subject}): [ Question ${selectedTests[subject] + 1} ]`);
     executeCommand({ command_type: "TEST", target: test.a, test_type: subject + " Test", audio_prompt: test.q, timestamp: new Date().getTime(), status: "AWAITING_INPUT" });
     speak("Question deployed.");
   };
 
-const deploySmartLesson = async () => {
+  const deploySmartLesson = async () => {
     try {
       setIsAILoading(true);
       speak("Consulting AI model for student weaknesses.");
+      logTelemetry(`Consulting Machine Learning Server for weak points...`);
       
-      // 🔗 This is the bridge to your Cloud AI
       const response = await fetch(`https://divya-drishti-ai.vercel.app/predict_hardest?student=${currentStudent}`);
       const data = await response.json();
-      
       const suggestedLetter = data.suggested_remedial_letter;
       
+      logTelemetry(`AI Deployed Remedial Lesson for: [ ${suggestedLetter} ]`);
       executeCommand({ 
-        command_type: "FORCE_HARDWARE", 
-        target: suggestedLetter, 
-        test_type: "AI Remedial", 
-        audio_prompt: `AI Remedial. Find the character ${suggestedLetter}`, 
-        timestamp: new Date().getTime(), 
-        status: "AWAITING_INPUT" 
+        command_type: "FORCE_HARDWARE", target: suggestedLetter, test_type: "AI Remedial", 
+        audio_prompt: `AI Remedial. Find the character ${suggestedLetter}`, timestamp: new Date().getTime(), status: "AWAITING_INPUT" 
       });
       
       speak(`AI predicts difficulty with ${suggestedLetter}. Remedial session deployed.`);
     } catch (error) {
-      console.error("ML Server Offline", error);
-      speak("AI Server is offline. Please check your Vercel deployment.");
+      logTelemetry(`⚠️ AI Server Connection Failed!`);
+      speak("AI Server is offline.");
     } finally {
       setIsAILoading(false);
     }
@@ -167,80 +204,50 @@ const deploySmartLesson = async () => {
     link.download = `${currentStudent}_Logs.csv`;
     link.click();
   };
-// ═══════════════════════════════════════════════════════════════════════════
-  // 🎙️ VOICE ASSISTANT & KEYBOARD SHORTCUT
+
   // ═══════════════════════════════════════════════════════════════════════════
-  
+  // 4. VOICE ASSISTANT
+  // ═══════════════════════════════════════════════════════════════════════════
   const triggerVoiceAssistant = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      alert("Your browser doesn't support Voice AI. Please use Google Chrome or Edge.");
-      return;
-    }
+    if (!SpeechRecognition) return alert("Your browser doesn't support Voice AI.");
 
     const recognition = new SpeechRecognition();
-    
-    recognition.onstart = () => {
-      setIsListening(true);
-      speak("I am listening.");
-    };
+    recognition.onstart = () => { setIsListening(true); speak("I am listening."); };
 
     recognition.onresult = async (event) => {
       setIsListening(false);
       const transcript = event.results[0][0].transcript;
-      console.log("Teacher asked:", transcript);
-      
+      logTelemetry(`Asked AI: "${transcript}"`);
       speak("Thinking...");
 
       try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `You are a helpful, concise AI assistant for a teacher of visually impaired students. 
-        The teacher just said: "${transcript}". 
-        Give a very short, helpful reply (1 to 2 sentences maximum) that can be easily spoken out loud. 
-        Do not use bolding, asterisks, or markdown.`;
-        
-        const result = await model.generateContent(prompt);
+        const result = await model.generateContent(`You are an assistant for a teacher of visually impaired students. They said: "${transcript}". Give a short, helpful reply (1-2 sentences). No markdown.`);
         const responseText = result.response.text();
-        
-        console.log("AI Answer:", responseText);
-        speak(responseText); // Speak the AI's answer!
-        
+        speak(responseText); 
       } catch (error) {
-        console.error("Gemini Error:", error);
         speak("Sorry, I had trouble connecting to my AI brain.");
       }
     };
 
-    recognition.onerror = (event) => {
-      setIsListening(false);
-      console.error("Speech Error:", event.error);
-      speak("I didn't quite catch that. Please try again.");
-    };
-
+    recognition.onerror = () => { setIsListening(false); speak("I didn't quite catch that."); };
     recognition.start();
   };
 
-  // The Keyboard Shortcut Listener
   useEffect(() => {
     const handleKeyDown = (event) => {
-      // Don't trigger if the teacher is typing a student's name in a text box
-      if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA' || event.target.tagName === 'SELECT') {
-        return;
-      }
-
-      // If 'V' is pressed and it isn't already listening, wake up the AI
+      if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA' || event.target.tagName === 'SELECT') return;
       if ((event.code === 'KeyV' || event.key === 'v') && !isListening) {
-        event.preventDefault(); 
-        triggerVoiceAssistant();
+        event.preventDefault(); triggerVoiceAssistant();
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isListening]);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 4. UI RENDERING
+  // 5. UI RENDERING
   // ═══════════════════════════════════════════════════════════════════════════
   const cardStyle = { background: '#ffffff', padding: '25px', borderRadius: '15px', boxShadow: '0 8px 30px rgba(0,0,0,0.05)', border: '1px solid #f0f0f0', marginBottom: '20px' };
   const buttonStyle = { padding: '12px', borderRadius: '8px', border: 'none', fontWeight: 'bold', cursor: 'pointer', transition: 'all 0.2s' };
@@ -248,12 +255,16 @@ const deploySmartLesson = async () => {
   return (
     <div style={{ maxWidth: '1200px', margin: '40px auto', padding: '0 20px', fontFamily: 'Segoe UI, sans-serif', color: '#333' }}>
       <header style={{ ...cardStyle, display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '6px solid #db2777' }}>
-        <div><h1 style={{ margin: 0, color: '#db2777' }}>Divya-Drishti Educator Portal</h1><p style={{ margin: '5px 0 0 0', color: '#666' }}>IoT Braille Interface Node v3.1</p></div>
+        <div><h1 style={{ margin: 0, color: '#db2777' }}>Divya-Drishti Educator Portal</h1><p style={{ margin: '5px 0 0 0', color: '#666' }}>IoT Braille Interface Node v3.2</p></div>
         <div style={{ textAlign: 'right' }}>
-          <label style={{ display: 'block', fontWeight: 'bold', fontSize: '12px', color: '#db2777' }}>ACTIVE STUDENT</label>
-          <select value={currentStudent} onChange={(e) => setCurrentStudent(e.target.value)} style={{ padding: '10px', borderRadius: '8px', border: '2px solid #db2777', fontWeight: 'bold', minWidth: '180px' }}>
-            {studentList.map(name => <option key={name} value={name}>{name}</option>)}
-          </select>
+          <label style={{ display: 'block', fontWeight: 'bold', fontSize: '12px', color: '#db2777', marginBottom: '5px' }}>ACTIVE STUDENT</label>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <select value={currentStudent} onChange={(e) => setCurrentStudent(e.target.value)} style={{ padding: '10px', borderRadius: '8px', border: '2px solid #db2777', fontWeight: 'bold', minWidth: '180px' }}>
+              {studentList.map(name => <option key={name} value={name}>{name}</option>)}
+            </select>
+            {/* 🔴 NEW RESET BUTTON */}
+            <button onClick={handleResetStudent} style={{ background: '#ef4444', color: 'white', border: 'none', borderRadius: '8px', padding: '0 15px', fontWeight: 'bold', cursor: 'pointer' }} title="Erase Student Data">RESET</button>
+          </div>
         </div>
       </header>
 
@@ -271,13 +282,7 @@ const deploySmartLesson = async () => {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.5fr', gap: '30px' }}>
           <section>
             <div style={cardStyle}>
-              
-              {/* 🔴 NEW AI BUTTON PLACED HERE 🔴 */}
-              <button 
-                style={{ padding: '15px', background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)', color: 'white', border: 'none', borderRadius: '8px', width: '100%', fontWeight: 'bold', cursor: 'pointer', marginBottom: '30px', fontSize: '16px', boxShadow: '0 4px 15px rgba(139, 92, 246, 0.3)' }} 
-                onClick={deploySmartLesson}
-                disabled={isAILoading}
-              >
+              <button style={{ padding: '15px', background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)', color: 'white', border: 'none', borderRadius: '8px', width: '100%', fontWeight: 'bold', cursor: 'pointer', marginBottom: '30px', fontSize: '16px', boxShadow: '0 4px 15px rgba(139, 92, 246, 0.3)' }} onClick={deploySmartLesson} disabled={isAILoading}>
                 {isAILoading ? "⏳ Analyzing Data..." : "🧠 Deploy AI Adaptive Lesson"}
               </button>
 
@@ -315,11 +320,12 @@ const deploySmartLesson = async () => {
 
             <div style={{ ...cardStyle, background: '#1e293b', color: '#fff', border: 'none' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
-                <h3 style={{ margin: 0, color: '#38bdf8' }}>📡 Live Hardware Uplink</h3>
-                <button onClick={exportCSV} style={{ background: '#10b981', color: '#fff', border: 'none', padding: '5px 12px', borderRadius: '5px', fontWeight: 'bold', cursor: 'pointer' }}>EXPORT ANALYTICS</button>
+                <h3 style={{ margin: 0, color: '#38bdf8' }}>📡 Live Omni-Telemetry Uplink</h3>
+                <button onClick={exportCSV} style={{ background: '#10b981', color: '#fff', border: 'none', padding: '5px 12px', borderRadius: '5px', fontWeight: 'bold', cursor: 'pointer' }}>EXPORT DATA</button>
               </div>
+              {/* 🔴 NEW TELEMETRY CONSOLE */}
               <div style={{ fontFamily: 'monospace', fontSize: '13px', lineHeight: '1.6', height: '350px', overflowY: 'auto', borderTop: '1px solid #334155', paddingTop: '10px' }}>
-                {terminalLogs.map((log, i) => <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid #334155' }}>{log}</div>)}
+                {terminalLogs.map((log, i) => <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid #334155', color: log.includes("[STUDENT]") ? "#fde047" : (log.includes("Error") ? "#fca5a5" : "#e2e8f0") }}>{log}</div>)}
               </div>
             </div>
           </section>
@@ -340,19 +346,7 @@ const deploySmartLesson = async () => {
         </div>
       )}
 
-      {/* 🎙️ VOICE AI STATUS INDICATOR */}
-      <div 
-        onClick={triggerVoiceAssistant}
-        style={{
-          position: 'fixed', bottom: '30px', right: '30px', width: '60px', height: '60px',
-          borderRadius: '50%', background: isListening ? '#ef4444' : '#3b82f6', color: 'white',
-          display: 'flex', justifyContent: 'center', alignItems: 'center', fontSize: '24px',
-          boxShadow: '0 4px 15px rgba(0,0,0,0.2)', cursor: 'pointer', zIndex: 1000, transition: 'all 0.3s ease',
-          animation: isListening ? 'pulse 1.5s infinite' : 'none' // Optional: adds a pulsing effect
-  
-        }}
-        title="Press 'V' or Click to speak"
-      >
+      <div onClick={triggerVoiceAssistant} style={{ position: 'fixed', bottom: '30px', right: '30px', width: '60px', height: '60px', borderRadius: '50%', background: isListening ? '#ef4444' : '#3b82f6', color: 'white', display: 'flex', justifyContent: 'center', alignItems: 'center', fontSize: '24px', boxShadow: '0 4px 15px rgba(0,0,0,0.2)', cursor: 'pointer', zIndex: 1000, transition: 'all 0.3s ease', animation: isListening ? 'pulse 1.5s infinite' : 'none' }} title="Press 'V' or Click to speak">
         {isListening ? "👂" : "🎙️"}
       </div>
     </div>

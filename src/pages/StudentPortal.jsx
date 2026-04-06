@@ -8,11 +8,9 @@ function StudentPortal() {
   const [isLogged, setIsLogged] = useState(!!studentName);
   const [currentTask, setCurrentTask] = useState(null);
   
-  // State for the "Sticky" dots currently active in the cell
   const [currentCellDots, setCurrentCellDots] = useState(new Set());
   const [lastSubmittedChar, setLastSubmittedChar] = useState("");
 
-  // Braille Dictionary Mapping
   const brailleMap = {
     "1": "A", "12": "B", "14": "C", "145": "D", "15": "E", "124": "F",
     "1245": "G", "125": "H", "24": "I", "245": "J", "13": "K", "123": "L",
@@ -21,13 +19,14 @@ function StudentPortal() {
     "13456": "Y", "1356": "Z", "2": "1", "23": "2", "25": "3", "256": "4"
   };
 
-  // 🔴 MAPPING: Key -> Dot Number
-  const keyToDot = { 
-    'f': 1, 'd': 2, 's': 3, 
-    'j': 4, 'k': 5, 'l': 6 
+  const keyToDot = { 'f': 1, 'd': 2, 's': 3, 'j': 4, 'k': 5, 'l': 6 };
+
+  // 🟢 TELEMETRY LOGGER: Sends everything to the Teacher's screen
+  const logStudentAction = (msg) => {
+    if (!studentName) return;
+    set(ref(db, `Learning_Logs/${studentName}/Telemetry/${Date.now()}`), `[STUDENT] ${msg}`);
   };
 
-  // Fetch Student List for Dropdown
   useEffect(() => {
     const namesRef = ref(db, 'Learning_Logs');
     const unsubscribe = onValue(namesRef, (snapshot) => {
@@ -36,7 +35,6 @@ function StudentPortal() {
     return () => unsubscribe();
   }, []);
 
-  // Listen for unique missions
   useEffect(() => {
     if (!isLogged || !studentName) return;
     const studentPath = `Learning_Logs/${studentName}/Current_Command`;
@@ -52,24 +50,38 @@ function StudentPortal() {
     return () => unsubscribe();
   }, [isLogged, studentName]);
 
-  // 🔴 UPDATED KEYBOARD LOGIC
+  // 🟢 AUDIO SYNC: Speaks the full word when the ESP32 hardware finishes
+  useEffect(() => {
+    if (!isLogged) return;
+    const hardwareStatusRef = ref(db, 'Hardware_Link');
+    const unsubscribe = onValue(hardwareStatusRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        if (data.status === "COMPLETED" && data.target !== "NONE") {
+          speak(`The word is: ${data.target}`);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [isLogged]);
+
+  // 🔴 KEYBOARD LOGIC (With Telemetry Tracking)
   const handleKeyDown = useCallback((e) => {
     const key = e.key.toLowerCase();
 
-    // 1. Add Dot via Letter Keys
     if (keyToDot[key]) {
       const dot = keyToDot[key];
       setCurrentCellDots(prev => {
         const next = new Set(prev);
         if (!next.has(dot)) {
           next.add(dot);
-          speak(`Key ${key.toUpperCase()}`); // Now speaks the key name for clarity
+          speak(`Key ${key.toUpperCase()}`); 
+          logStudentAction(`Pressed Dot ${dot}`); // Logs dot to teacher
         }
         return next;
       });
     }
 
-    // 2. Submit (Spacebar)
     if (e.code === "Space") {
       e.preventDefault();
       const pattern = Array.from(currentCellDots).sort().join('');
@@ -80,18 +92,19 @@ function StudentPortal() {
         speak(`Submitting ${character}`);
         submitAnswer(character);
       } else {
+        logStudentAction(`Attempted to submit invalid pattern: ${pattern}`); // Logs error to teacher
         speak("Pattern not recognized. Try again.");
       }
       setCurrentCellDots(new Set()); 
     }
 
-    // 3. Clear (Backspace)
     if (e.code === "Backspace") {
       e.preventDefault();
       setCurrentCellDots(new Set());
+      logStudentAction("Cleared the Braille Cell"); // Logs clear to teacher
       speak("Cleared");
     }
-  }, [currentCellDots, currentTask]);
+  }, [currentCellDots, currentTask]); 
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -103,35 +116,24 @@ function StudentPortal() {
     const isCorrect = ans.toUpperCase() === currentTask.target.toUpperCase();
     const timestamp = new Date().getTime();
 
-    // Log to Firebase
+    // Log the final answer to the Teacher's Telemetry Channel
+    logStudentAction(`Submitted Answer: [ ${ans} ] | Target: [ ${currentTask.target} ] | Result: ${isCorrect ? "SUCCESS" : "ERROR"}`);
+
+    // Standard Logging for Analytics Chart
     set(ref(db, `Learning_Logs/${studentName}/${timestamp}`), {
-      Character_ID: ans,
-      Target_Character: currentTask.target,
-      Status: isCorrect ? "Success" : "Error",
-      Timestamp: timestamp,
+      Character_ID: ans, Target_Character: currentTask.target,
+      Status: isCorrect ? "Success" : "Error", Timestamp: timestamp,
       Dwell_Time_ms: timestamp - currentTask.timestamp
     });
 
-    // Update mission status for Teacher Dashboard
     set(ref(db, `Learning_Logs/${studentName}/Current_Command/status`), isCorrect ? "SUCCESS" : "ERROR");
     speak(isCorrect ? "That is correct!" : "Not quite. Check the Braille cell again.");
   };
 
-  const speak = (t) => {
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(t));
-  };
+  const speak = (t) => { window.speechSynthesis.cancel(); window.speechSynthesis.speak(new SpeechSynthesisUtterance(t)); };
 
-  // 🔴 CUSTOM UI COMPONENT: Dot labeled with Letter
   const DotButton = ({ dotNum, label }) => (
-    <div style={{
-      width: '90px', height: '90px', borderRadius: '50%', 
-      border: '5px solid #db2777', margin: '15px',
-      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      background: currentCellDots.has(dotNum) ? '#db2777' : 'white',
-      color: currentCellDots.has(dotNum) ? 'white' : '#db2777',
-      transition: 'all 0.15s ease'
-    }}>
+    <div style={{ width: '90px', height: '90px', borderRadius: '50%', border: '5px solid #db2777', margin: '15px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: currentCellDots.has(dotNum) ? '#db2777' : 'white', color: currentCellDots.has(dotNum) ? 'white' : '#db2777', transition: 'all 0.15s ease' }}>
       <span style={{ fontSize: '14px', fontWeight: 'bold' }}>DOT {dotNum}</span>
       <span style={{ fontSize: '32px', fontWeight: '900' }}>{label}</span>
     </div>
@@ -146,13 +148,7 @@ function StudentPortal() {
             <option value="">Choose Your Name</option>
             {studentList.map(n => <option key={n} value={n}>{n}</option>)}
           </select>
-          <button 
-            style={{ padding: '15px 40px', marginLeft: '15px', background: '#db2777', color: 'white', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer' }}
-            onClick={() => {
-              const val = document.getElementById('sSel').value;
-              if (val) { setStudentName(val); localStorage.setItem("myStudentName", val); setIsLogged(true); }
-            }}
-          >Enter Hub</button>
+          <button style={{ padding: '15px 40px', marginLeft: '15px', background: '#db2777', color: 'white', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer' }} onClick={() => { const val = document.getElementById('sSel').value; if (val) { setStudentName(val); localStorage.setItem("myStudentName", val); setIsLogged(true); } }}>Enter Hub</button>
         </div>
       </div>
     );
@@ -172,32 +168,19 @@ function StudentPortal() {
             <p style={{ fontSize: '30px', fontWeight: 'bold', margin: '15px 0' }}>{currentTask.audio_prompt}</p>
           </div>
 
-          {/* 🔴 RESTORED & LABELED DOTS 🔴 */}
           <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '40px' }}>
-            <div style={{ display: 'flex', flexDirection: 'column' }}>
-              <DotButton dotNum={1} label="F" />
-              <DotButton dotNum={2} label="D" />
-              <DotButton dotNum={3} label="S" />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column' }}>
-              <DotButton dotNum={4} label="J" />
-              <DotButton dotNum={5} label="K" />
-              <DotButton dotNum={6} label="L" />
-            </div>
+            <div style={{ display: 'flex', flexDirection: 'column' }}><DotButton dotNum={1} label="F" /><DotButton dotNum={2} label="D" /><DotButton dotNum={3} label="S" /></div>
+            <div style={{ display: 'flex', flexDirection: 'column' }}><DotButton dotNum={4} label="J" /><DotButton dotNum={5} label="K" /><DotButton dotNum={6} label="L" /></div>
           </div>
 
           <div style={{ background: '#f8fafc', padding: '20px', borderRadius: '15px' }}>
             <p style={{ margin: 0, fontWeight: 'bold', color: '#64748b' }}>TRANSLATED INPUT</p>
             <span style={{ fontSize: '64px', fontWeight: '900', color: '#db2777' }}>{lastSubmittedChar || "?"}</span>
-            <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8', fontWeight: 'bold' }}>
-              [SPACEBAR TO SUBMIT] • [BACKSPACE TO RESET CELL]
-            </div>
+            <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8', fontWeight: 'bold' }}>[SPACEBAR TO SUBMIT] • [BACKSPACE TO RESET CELL]</div>
           </div>
         </div>
       ) : (
-        <div style={{ marginTop: '100px' }}>
-          <h2 style={{ color: '#cbd5e1' }}>Waiting for the teacher to start a lesson...</h2>
-        </div>
+        <div style={{ marginTop: '100px' }}><h2 style={{ color: '#cbd5e1' }}>Waiting for the teacher to start a lesson...</h2></div>
       )}
     </div>
   );
