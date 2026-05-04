@@ -1,30 +1,84 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { db } from '../services/firebase';
 import { ref, onValue, set } from 'firebase/database';
+import { brailleMap, keyToDot } from '../utils/constants';
+import { parseStudentCommand } from '../utils/aiCommandRouter';
+
+
+import StudentLogin from '../components/Student/StudentLogin';
+import StudentHeader from '../components/Student/StudentHeader';
+import ClassroomTab from '../components/Student/ClassroomTab';
+import VisionTab from '../components/Student/VisionTab';
+import EncyclopediaTab from '../components/Student/EncyclopediaTab';
+import BottomNav from '../components/Student/BottomNav';
+import ArenaMode from '../components/Student/ArenaMode';
 
 function StudentPortal() {
+  // 🟢 NAVIGATION & GLOBAL STATES
+  const [activeTab, setActiveTab] = useState('classroom');   
   const [studentList, setStudentList] = useState([]);
   const [studentName, setStudentName] = useState(() => localStorage.getItem("myStudentName") || "");
   const [isLogged, setIsLogged] = useState(!!studentName);
-  const [currentTask, setCurrentTask] = useState(null);
   
+  // 🟢 CLASSROOM / TUTOR STATES
+  const [currentTask, setCurrentTask] = useState(null);
   const [currentCellDots, setCurrentCellDots] = useState(new Set());
-  const [lastSubmittedChar, setLastSubmittedChar] = useState("");
+  const [wordBuffer, setWordBuffer] = useState("");
 
-  const brailleMap = {
-    "1": "A", "12": "B", "14": "C", "145": "D", "15": "E", "124": "F",
-    "1245": "G", "125": "H", "24": "I", "245": "J", "13": "K", "123": "L",
-    "134": "M", "1345": "N", "135": "O", "1234": "P", "12345": "Q", "1235": "R",
-    "234": "S", "2345": "T", "136": "U", "1236": "V", "2456": "W", "1346": "X",
-    "13456": "Y", "1356": "Z", "2": "1", "23": "2", "25": "3", "256": "4"
+  // 🟢 ARENA STATES
+  const [globalArena, setGlobalArena] = useState({ isActive: false, targetWord: "", timestamp: 0 });
+  const [localArenaDismissed, setLocalArenaDismissed] = useState(false);
+
+  // 🟢 AI VISION STATES
+  const webcamRef = useRef(null); 
+  const [isScanning, setIsScanning] = useState(false);
+  const [inventory, setInventory] = useState([]);
+
+  // 🟢 ENCYCLOPEDIA CHAT STATES
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [isChatMicActive, setIsChatMicActive] = useState(false);
+
+  // 🎤 GLOBAL VOICE ASSISTANT STATES
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null);
+  const isSpeakingRef = useRef(false); 
+  const scanActionRef = useRef(null);
+  const clearActionRef = useRef(null);
+  const handleSendChatRef = useRef(null); // 🟢 NEW: Ref to access chat from global mic
+  const speak = (t) => { 
+    window.speechSynthesis.cancel(); 
+    const utterance = new SpeechSynthesisUtterance(t);
+    
+    utterance.onstart = () => {
+        isSpeakingRef.current = true;
+        try { recognitionRef.current?.abort(); } catch(e) {}
+    };
+
+    utterance.onend = () => {
+        isSpeakingRef.current = false;
+        if (isLogged) {
+            setTimeout(() => {
+                if (!isSpeakingRef.current && !isChatMicActive) {
+                    try { recognitionRef.current?.start(); } catch(e) {}
+                }
+            }, 500);
+        }
+    };
+
+    window.speechSynthesis.speak(utterance); 
   };
 
-  const keyToDot = { 'f': 1, 'd': 2, 's': 3, 'j': 4, 'k': 5, 'l': 6 };
-
-  // 🟢 TELEMETRY LOGGER: Sends everything to the Teacher's screen
   const logStudentAction = (msg) => {
     if (!studentName) return;
     set(ref(db, `Learning_Logs/${studentName}/Telemetry/${Date.now()}`), `[STUDENT] ${msg}`);
+  };
+
+  const getDotsForChar = (char) => {
+    const entry = Object.entries(brailleMap).find(([dots, c]) => c === char);
+    return entry ? entry[0].split('').join(' and ') : '';
   };
 
   useEffect(() => {
@@ -39,72 +93,404 @@ function StudentPortal() {
     if (!isLogged || !studentName) return;
     const studentPath = `Learning_Logs/${studentName}/Current_Command`;
     const unsubscribe = onValue(ref(db, studentPath), (snapshot) => {
-      if (snapshot.exists()) {
-        const task = snapshot.val();
-        setCurrentTask(task);
-        if (task.status === "AWAITING_INPUT") {
-          speak(`New Mission. ${task.audio_prompt}. Press your Braille keys and hit Space to finish.`);
+      if (snapshot.exists() && activeTab === 'classroom') {
+        const incomingTask = snapshot.val();
+        
+        if (incomingTask.status === "COMPLETED" || incomingTask.status === "CANCELLED") {
+            setCurrentTask(null);
+            return;
         }
+
+        setCurrentTask((prevTask) => {
+          if (!prevTask || prevTask.timestamp !== incomingTask.timestamp) setWordBuffer(""); 
+          return { ...incomingTask, mode: incomingTask.mode || 'TEACHER' }; 
+        });
+      }
+    });
+    return () => unsubscribe();
+  }, [isLogged, studentName, activeTab]);
+
+  // 🟢 LISTEN TO GLOBAL ARENA
+  useEffect(() => {
+    if (!isLogged || !studentName) return;
+    const unsubscribe = onValue(ref(db, 'Global_Arena'), (snapshot) => {
+      if (snapshot.exists()) {
+        const arenaData = snapshot.val();
+        if (arenaData.isActive && (!globalArena.isActive || arenaData.timestamp !== globalArena.timestamp)) {
+           setWordBuffer(""); // Clear buffer on new arena start
+           setCurrentCellDots(new Set());
+           setLocalArenaDismissed(false); // Re-open arena on a newly deployed broadcast
+        }
+        setGlobalArena(arenaData || { isActive: false, targetWord: "", timestamp: 0 });
+      } else {
+        setGlobalArena({ isActive: false, targetWord: "", timestamp: 0 });
       }
     });
     return () => unsubscribe();
   }, [isLogged, studentName]);
 
-  // 🟢 AUDIO SYNC: Speaks the full word when the ESP32 hardware finishes
+  // 🟢 UPDATE ARENA TELEMETRY
   useEffect(() => {
-    if (!isLogged) return;
-    const hardwareStatusRef = ref(db, 'Hardware_Link');
-    const unsubscribe = onValue(hardwareStatusRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.val();
-        if (data.status === "COMPLETED" && data.target !== "NONE") {
-          speak(`The word is: ${data.target}`);
-        }
-      }
+    if (!isLogged || !studentName || !globalArena.isActive) return;
+    
+    const progress = globalArena.targetWord ? Math.round((wordBuffer.length / globalArena.targetWord.length) * 100) : 0;
+    const isCompleted = wordBuffer.toUpperCase() === globalArena.targetWord.toUpperCase();
+
+    set(ref(db, `Arena_Telemetry/${studentName}`), {
+      currentInput: wordBuffer,
+      progressPercentage: progress,
+      lastKeystrokeTime: Date.now(),
+      status: isCompleted ? "completed" : "typing"
     });
-    return () => unsubscribe();
-  }, [isLogged]);
 
-  // 🔴 KEYBOARD LOGIC (With Telemetry Tracking)
-  const handleKeyDown = useCallback((e) => {
-    const key = e.key.toLowerCase();
-
-    if (keyToDot[key]) {
-      const dot = keyToDot[key];
-      setCurrentCellDots(prev => {
-        const next = new Set(prev);
-        if (!next.has(dot)) {
-          next.add(dot);
-          speak(`Key ${key.toUpperCase()}`); 
-          logStudentAction(`Pressed Dot ${dot}`); // Logs dot to teacher
-        }
-        return next;
-      });
+    if (isCompleted) {
+      speak(`Incredible! You completed the arena challenge!`);
+      // Optional: Auto close or let teacher close
     }
+  }, [wordBuffer, globalArena.isActive, isLogged, studentName]);
 
-    if (e.code === "Space") {
-      e.preventDefault();
-      const pattern = Array.from(currentCellDots).sort().join('');
-      const character = brailleMap[pattern] || "?";
+  useEffect(() => {
+    if (currentTask && currentTask.mode === 'TUTOR' && currentTask.currentIndex < currentTask.target.length) {
+      const expectedChar = currentTask.target[currentTask.currentIndex];
+      const dots = getDotsForChar(expectedChar);
+      const hintTimer = setTimeout(() => { speak(`Hint: To type ${expectedChar}, press dots ${dots}.`); }, 8000); 
+      return () => clearTimeout(hintTimer); 
+    }
+  }, [currentTask]);
+
+
+  // 🎤 GLOBAL HTML5 VOICE ASSISTANT
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
       
-      if (character !== "?") {
-        setLastSubmittedChar(character);
-        speak(`Submitting ${character}`);
-        submitAnswer(character);
-      } else {
-        logStudentAction(`Attempted to submit invalid pattern: ${pattern}`); // Logs error to teacher
-        speak("Pattern not recognized. Try again.");
+      recognition.continuous = false; 
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => setIsListening(true);
+      
+      recognition.onend = () => {
+        setIsListening(false);
+        if (isLogged && !isSpeakingRef.current && !isChatMicActive) {
+            setTimeout(() => { 
+                if (recognitionRef.current && !isSpeakingRef.current && !isChatMicActive) {
+                    try { recognitionRef.current.start(); } catch(e) {} 
+                }
+            }, 800); 
+        }
+      };
+
+      recognition.onerror = () => setIsListening(false);
+
+      recognitionRef.current = recognition;
+    }
+    return () => { if (recognitionRef.current) recognitionRef.current.stop(); };
+  }, [isLogged, isChatMicActive]);
+
+  // 🟢 UPGRADED: STATE-MACHINE VOICE COMMAND ROUTER
+  useEffect(() => {
+    if (!recognitionRef.current) return;
+
+    recognitionRef.current.onresult = async (event) => {
+      const current = event.resultIndex;
+      const transcript = event.results[current][0].transcript.toLowerCase().trim();
+      
+      if (!transcript) return; 
+
+      console.log("🎤 Global Voice Heard:", transcript);
+
+      // --- OMNIPOTENT AI ROUTER ---
+      speak("Thinking...");
+      const response = await parseStudentCommand(transcript);
+      const { intent, args } = response;
+
+      switch (intent) {
+        case 'NAVIGATE_TAB':
+          setActiveTab(args.tab);
+          speak(`Navigating to ${args.tab} tab.`);
+          break;
+        case 'SCAN_OBJECT':
+          setActiveTab('vision');
+          if (scanActionRef.current) {
+            speak("Scanning object now.");
+            setTimeout(() => scanActionRef.current(), 1000);
+          }
+          break;
+        case 'CLEAR_CELL':
+          setActiveTab('classroom');
+          if (clearActionRef.current) clearActionRef.current();
+          break;
+        default:
+          // Fallback to chat if they just asked a question
+          if (activeTab === 'fluency' && currentTask && currentTask.target && handleSendChatRef.current) {
+            handleSendChatRef.current(transcript);
+          } else if (activeTab === 'classroom') {
+            try {
+              const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "YOUR_GROQ_API_KEY"; 
+              const chatRes = await fetch(`https://api.groq.com/openai/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: "llama-3.1-8b-instant", 
+                  messages: [
+                    { role: "system", content: "You are an encouraging tutor for a blind student. Keep answers to 1 short sentence." },
+                    { role: "user", content: transcript }
+                  ],
+                  max_tokens: 80, temperature: 0.5 
+                })
+              });
+              const data = await chatRes.json();
+              speak(data.choices[0].message.content.trim()); 
+            } catch (error) {
+              speak(args.reply || "I am here to help you learn.");
+            }
+          } else {
+            speak(args.reply || "Please scan an object first or ask me a question in the classroom.");
+          }
       }
-      setCurrentCellDots(new Set()); 
+    };
+  }, [activeTab, currentTask]);
+
+
+  // 📖 ENHANCED AI VISION
+  const executeAIScan = async () => {
+    if (isScanning || !webcamRef.current) return;
+
+    const imageSrc = webcamRef.current.getScreenshot();
+    if (!imageSrc) return alert("🚨 Failed to capture image!");
+
+    setIsScanning(true);
+    speak("Analyzing image.");
+    if (navigator.vibrate) navigator.vibrate([50, 100, 50]);
+
+    try {
+      const base64Image = imageSrc.split(',')[1];
+      const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "YOUR_GROQ_API_KEY";
+      
+      const response = await fetch(`https://api.groq.com/openai/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: "meta-llama/llama-4-scout-17b-16e-instruct",
+          messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: "Identify the single most prominent physical object. Return ONLY valid JSON with three keys: 'word' (just the object name, 1 word), 'story' (1 poetic sentence), and 'explanation' (2 detailed sentences). Do not use markdown blocks." },
+                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+              ]
+          }],
+          max_tokens: 300, temperature: 0.1 
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Vision API Error: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      const rawText = data.choices[0].message.content;
+      
+      let detectedWord = "OBJECT";
+      let storyFact = "Let's learn how to spell this.";
+      let detailedExp = "This is a wonderful object.";
+
+      try {
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            detectedWord = parsed.word?.replace(/[^a-zA-Z]/g, '').toUpperCase() || "OBJECT";
+            storyFact = parsed.story || storyFact;
+            detailedExp = parsed.explanation || detailedExp;
+        } else {
+            detectedWord = rawText.split(' ')[0].replace(/[^a-zA-Z]/g, '').toUpperCase() || "OBJECT";
+        }
+      } catch(e) {
+        console.error("Failed to parse AI Vision:", e);
+      }
+
+      speak(`You found a ${detectedWord}! ${storyFact} Let's spell it together.`);
+      if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+      
+      setIsScanning(false);
+      setChatMessages([]); 
+      setChatInput("");
+
+      const newTutorTask = {
+        mode: 'TUTOR', original_question: `You found a ${detectedWord}!`,
+        story_fact: storyFact, detailed_explanation: detailedExp, target: detectedWord,
+        currentIndex: 0, status: "AWAITING_INPUT", timestamp: Date.now()
+      };
+      
+      set(ref(db, `Learning_Logs/${studentName}/Current_Command`), newTutorTask);
+      setWordBuffer("");
+      setActiveTab('classroom'); 
+
+    } catch (error) {
+      alert(`🚨 GROQ AI FAILED TO SCAN:\n\n${error.message}`); 
+      setIsScanning(false);
+    }
+  };
+
+  useEffect(() => { scanActionRef.current = executeAIScan; }, [isScanning, executeAIScan]);
+
+  // 🟢 DEDICATED ENCYCLOPEDIA CHAT SUBMITTER
+  const handleSendChat = async (voiceTextOverride) => {
+    const textToSend = typeof voiceTextOverride === 'string' ? voiceTextOverride : chatInput;
+    if (!textToSend || !textToSend.trim() || !currentTask?.target) return;
+
+    const userMsg = { role: 'user', content: textToSend };
+    setChatMessages(prev => [...prev, userMsg]);
+    setChatInput("");
+    setIsChatLoading(true);
+
+    try {
+        const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || "YOUR_GROQ_API_KEY"; 
+        
+        const messageHistory = chatMessages.map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content
+        }));
+
+        const response = await fetch(`https://api.groq.com/openai/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: "llama-3.3-70b-versatile", 
+                messages: [
+                    {
+                        role: "system",
+                        content: `You are an educational AI tutor for a blind student. The student is holding and examining a physical object: a ${currentTask.target}. Answer their questions about this ${currentTask.target} simply and engagingly in 1-2 short sentences. Do not use markdown.`
+                    },
+                    ...messageHistory,
+                    { role: "user", content: textToSend }
+                ],
+                max_tokens: 100, temperature: 0.5 
+            })
+        });
+
+        if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.error?.message || "Chat Network Error");
+        }
+
+        const data = await response.json();
+        const aiText = data.choices[0].message.content.trim();
+        
+        setChatMessages(prev => [...prev, { role: 'ai', content: aiText }]);
+        speak(aiText);
+
+    } catch (error) {
+        console.error(error);
+        const errorMsg = "Sorry, my servers are a little busy right now. Try asking again.";
+        setChatMessages(prev => [...prev, { role: 'ai', content: errorMsg }]);
+        speak(errorMsg);
+    } finally {
+        setIsChatLoading(false);
+    }
+  };
+
+  // 🟢 Bind the ref so the global mic can trigger chat
+  handleSendChatRef.current = handleSendChat;
+
+  // 🟢 DEDICATED ENCYCLOPEDIA CHAT MICROPHONE
+  const startChatMic = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return alert("Speech recognition not supported.");
+    
+    try { recognitionRef.current?.abort(); } catch(e) {}
+
+    const chatMic = new SpeechRecognition();
+    chatMic.continuous = false;
+    chatMic.interimResults = false;
+    chatMic.lang = 'en-US';
+
+    chatMic.onstart = () => {
+        setIsChatMicActive(true);
+        if (navigator.vibrate) navigator.vibrate(50);
+    };
+    
+    chatMic.onend = () => setIsChatMicActive(false);
+    chatMic.onerror = () => setIsChatMicActive(false);
+    
+    chatMic.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        if (!transcript || !transcript.trim()) return; 
+        console.log("🗣️ Chat Mic Heard:", transcript);
+        handleSendChat(transcript); 
+    };
+    
+    chatMic.start();
+  };
+
+  const cancelTutorTask = () => {
+    if (studentName) set(ref(db, `Learning_Logs/${studentName}/Current_Command/status`), "CANCELLED");
+    setCurrentTask(null); setWordBuffer(""); setActiveTab('vision');
+  };
+
+  const toggleDot = useCallback((dot) => {
+    setCurrentCellDots(prev => {
+      const next = new Set(prev);
+      if (!next.has(dot)) { next.add(dot); speak(`Dot ${dot}`); } 
+      else { next.delete(dot); }
+      if (navigator.vibrate) navigator.vibrate(20);
+      return next;
+    });
+  }, []);
+
+  const handleSpace = useCallback(() => {
+    if (currentCellDots.size === 0) return; 
+    const pattern = Array.from(currentCellDots).sort().join('');
+    const character = brailleMap[pattern] || "?";
+    
+    if (character === "?") {
+      speak("Invalid Character"); setCurrentCellDots(new Set()); return;
     }
 
-    if (e.code === "Backspace") {
-      e.preventDefault();
-      setCurrentCellDots(new Set());
-      logStudentAction("Cleared the Braille Cell"); // Logs clear to teacher
-      speak("Cleared");
+    if (currentTask && currentTask.mode === 'TUTOR') {
+      const expectedChar = currentTask.target[currentTask.currentIndex];
+      if (character === expectedChar) {
+        const newIndex = currentTask.currentIndex + 1;
+        setWordBuffer(prev => prev + character);
+        if (newIndex === currentTask.target.length) {
+          speak(`Beautifully done! You spelled ${currentTask.target}.`);
+          setInventory(prev => [...prev, currentTask.target]); 
+          set(ref(db, `Learning_Logs/${studentName}/Current_Command/status`), "COMPLETED");
+          setWordBuffer("");
+          setTimeout(() => setActiveTab('vision'), 3500); 
+        } else {
+          speak(`Good! The next letter is ${currentTask.target[newIndex]}.`);
+          set(ref(db, `Learning_Logs/${studentName}/Current_Command/currentIndex`), newIndex); 
+        }
+      } else {
+        speak(`Not quite. Try again. We need the letter ${expectedChar}.`);
+      }
+    } 
+    else {
+      setWordBuffer(prev => prev + character); speak(character);
     }
-  }, [currentCellDots, currentTask]); 
+    setCurrentCellDots(new Set()); 
+  }, [currentCellDots, currentTask]);
+
+  const handleDelete = useCallback(() => {
+    if (currentCellDots.size > 0) { setCurrentCellDots(new Set()); speak("Cell cleared"); } 
+    else if (wordBuffer.length > 0 && (!currentTask || currentTask.mode !== 'TUTOR')) {
+        setWordBuffer(prev => prev.slice(0, -1)); speak("Letter deleted");
+    }
+  }, [currentCellDots, wordBuffer, currentTask]);
+
+  useEffect(() => { clearActionRef.current = handleDelete; }, [handleDelete]);
+
+  const handleKeyDown = useCallback((e) => {
+    if (activeTab !== 'classroom') return; 
+    const key = e.key.toLowerCase();
+    if (keyToDot[key]) { toggleDot(keyToDot[key]); }
+    if (e.code === "Space") { e.preventDefault(); handleSpace(); }
+    if (e.code === "Enter") { e.preventDefault(); if (wordBuffer.length > 0) submitAnswer(wordBuffer); }
+    if (e.code === "Backspace") { e.preventDefault(); handleDelete(); }
+  }, [toggleDot, handleSpace, handleDelete, wordBuffer, activeTab, currentTask]); 
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -115,74 +501,94 @@ function StudentPortal() {
     if (!currentTask) return;
     const isCorrect = ans.toUpperCase() === currentTask.target.toUpperCase();
     const timestamp = new Date().getTime();
-
-    // Log the final answer to the Teacher's Telemetry Channel
-    logStudentAction(`Submitted Answer: [ ${ans} ] | Target: [ ${currentTask.target} ] | Result: ${isCorrect ? "SUCCESS" : "ERROR"}`);
-
-    // Standard Logging for Analytics Chart
-    set(ref(db, `Learning_Logs/${studentName}/${timestamp}`), {
-      Character_ID: ans, Target_Character: currentTask.target,
-      Status: isCorrect ? "Success" : "Error", Timestamp: timestamp,
-      Dwell_Time_ms: timestamp - currentTask.timestamp
+    set(ref(db, `Learning_Logs/${studentName}/${timestamp}`), { 
+      Submitted_Word: ans, Target_Word: currentTask.target, Status: isCorrect ? "Success" : "Error"
     });
-
     set(ref(db, `Learning_Logs/${studentName}/Current_Command/status`), isCorrect ? "SUCCESS" : "ERROR");
-    speak(isCorrect ? "That is correct!" : "Not quite. Check the Braille cell again.");
+    speak(isCorrect ? "Excellent! That is the correct answer." : "Not quite right. Clear it and try again.");
+    if (isCorrect) setWordBuffer(""); 
   };
 
-  const speak = (t) => { window.speechSynthesis.cancel(); window.speechSynthesis.speak(new SpeechSynthesisUtterance(t)); };
+  if (!isLogged) { 
+    return <StudentLogin studentList={studentList} setStudentName={setStudentName} setIsLogged={setIsLogged} />;
+  }
 
-  const DotButton = ({ dotNum, label }) => (
-    <div style={{ width: '90px', height: '90px', borderRadius: '50%', border: '5px solid #db2777', margin: '15px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: currentCellDots.has(dotNum) ? '#db2777' : 'white', color: currentCellDots.has(dotNum) ? 'white' : '#db2777', transition: 'all 0.15s ease' }}>
-      <span style={{ fontSize: '14px', fontWeight: 'bold' }}>DOT {dotNum}</span>
-      <span style={{ fontSize: '32px', fontWeight: '900' }}>{label}</span>
-    </div>
-  );
+  const currentPattern = Array.from(currentCellDots).sort().join('');
+  const liveTranslation = brailleMap[currentPattern] || (currentCellDots.size > 0 ? "?" : "");
 
-  if (!isLogged) {
+  const toggleMic = () => {
+    if (isListening) { recognitionRef.current?.stop(); speak("Microphone paused."); } 
+    else { try { recognitionRef.current?.start(); } catch(e){} speak("Microphone active."); }
+  };
+
+  if (globalArena.isActive && globalArena.targetWord && !localArenaDismissed) {
     return (
-      <div style={{ padding: '60px', textAlign: 'center', fontFamily: 'sans-serif', background: '#fdf2f8', minHeight: '100vh' }}>
-        <h1 style={{ color: '#db2777', fontSize: '42px' }}>Divya Drishti Portal</h1>
-        <div style={{ background: 'white', padding: '40px', borderRadius: '20px', display: 'inline-block', boxShadow: '0 10px 30px rgba(0,0,0,0.05)' }}>
-          <select id="sSel" style={{ padding: '15px', fontSize: '18px', borderRadius: '10px', width: '250px', border: '2px solid #fbcfe8' }}>
-            <option value="">Choose Your Name</option>
-            {studentList.map(n => <option key={n} value={n}>{n}</option>)}
-          </select>
-          <button style={{ padding: '15px 40px', marginLeft: '15px', background: '#db2777', color: 'white', border: 'none', borderRadius: '10px', fontWeight: 'bold', cursor: 'pointer' }} onClick={() => { const val = document.getElementById('sSel').value; if (val) { setStudentName(val); localStorage.setItem("myStudentName", val); setIsLogged(true); } }}>Enter Hub</button>
-        </div>
-      </div>
+      <ArenaMode 
+        globalArena={globalArena} 
+        studentName={studentName} 
+        wordBuffer={wordBuffer} 
+        setWordBuffer={setWordBuffer}
+        currentCellDots={currentCellDots}
+        toggleDot={toggleDot}
+        handleSpace={handleSpace}
+        handleDelete={handleDelete}
+        speak={speak}
+        onDismiss={() => setLocalArenaDismissed(true)}
+      />
     );
   }
 
   return (
-    <div style={{ maxWidth: '900px', margin: '0 auto', padding: '40px', textAlign: 'center', fontFamily: 'sans-serif' }}>
-      <header style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '3px solid #db2777', paddingBottom: '15px', marginBottom: '30px' }}>
-        <h2 style={{ color: '#db2777' }}>Learning Session: {studentName}</h2>
-        <button onClick={() => { setIsLogged(false); localStorage.removeItem("myStudentName"); }} style={{ padding: '8px 15px', borderRadius: '5px', border: '1px solid #ccc', cursor: 'pointer' }}>Switch User</button>
-      </header>
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5 }} style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg-void)', fontFamily: "'Outfit', sans-serif", overflow: 'hidden' }}>
+      
+      <StudentHeader isListening={isListening} toggleMic={toggleMic} speak={speak} />
 
-      {currentTask ? (
-        <div>
-          <div style={{ background: '#fff1f2', padding: '30px', borderRadius: '20px', border: '2px solid #fecdd3', marginBottom: '40px' }}>
-            <h4 style={{ margin: 0, color: '#be185d', letterSpacing: '1px' }}>INSTRUCTOR'S QUESTION</h4>
-            <p style={{ fontSize: '30px', fontWeight: 'bold', margin: '15px 0' }}>{currentTask.audio_prompt}</p>
-          </div>
+      <main style={{ flex: 1, display: 'flex', padding: '10px', gap: '10px', paddingBottom: '90px', overflowY: 'auto' }}>
+        {activeTab === 'classroom' && (
+          <ClassroomTab
+            currentTask={currentTask}
+            currentCellDots={currentCellDots}
+            wordBuffer={wordBuffer}
+            liveTranslation={liveTranslation}
+            toggleDot={toggleDot}
+            handleSpace={handleSpace}
+            handleDelete={handleDelete}
+            cancelTutorTask={cancelTutorTask}
+          />
+        )}
 
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '40px' }}>
-            <div style={{ display: 'flex', flexDirection: 'column' }}><DotButton dotNum={1} label="F" /><DotButton dotNum={2} label="D" /><DotButton dotNum={3} label="S" /></div>
-            <div style={{ display: 'flex', flexDirection: 'column' }}><DotButton dotNum={4} label="J" /><DotButton dotNum={5} label="K" /><DotButton dotNum={6} label="L" /></div>
-          </div>
+        {activeTab === 'vision' && (
+          <VisionTab
+            webcamRef={webcamRef}
+            isScanning={isScanning}
+            executeAIScan={executeAIScan}
+          />
+        )}
 
-          <div style={{ background: '#f8fafc', padding: '20px', borderRadius: '15px' }}>
-            <p style={{ margin: 0, fontWeight: 'bold', color: '#64748b' }}>TRANSLATED INPUT</p>
-            <span style={{ fontSize: '64px', fontWeight: '900', color: '#db2777' }}>{lastSubmittedChar || "?"}</span>
-            <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8', fontWeight: 'bold' }}>[SPACEBAR TO SUBMIT] • [BACKSPACE TO RESET CELL]</div>
-          </div>
-        </div>
-      ) : (
-        <div style={{ marginTop: '100px' }}><h2 style={{ color: '#cbd5e1' }}>Waiting for the teacher to start a lesson...</h2></div>
-      )}
-    </div>
+        {activeTab === 'fluency' && (
+          <EncyclopediaTab
+            currentTask={currentTask}
+            speak={speak}
+            chatMessages={chatMessages}
+            isChatLoading={isChatLoading}
+            isChatMicActive={isChatMicActive}
+            startChatMic={startChatMic}
+            chatInput={chatInput}
+            setChatInput={setChatInput}
+            handleSendChat={handleSendChat}
+            setActiveTab={setActiveTab}
+          />
+        )}
+      </main>
+
+      <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} speak={speak} />
+
+      <style>{`
+        @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.5); } 100% { opacity: 1; transform: scale(1); } }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+      `}</style>
+    </motion.div>
   );
 }
 
